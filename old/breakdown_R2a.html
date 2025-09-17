@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>NISA vs 特定口座 取り崩しシミュレーター</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css"/>
+<style>
+  :root { --pico-font-size: 16px; }
+  .grid { display: grid; gap: 1rem; }
+  @media(min-width: 1000px){ .grid-2 { grid-template-columns: 360px 1fr; } }
+  .mono { font-variant-numeric: tabular-nums; font-family: ui-monospace, Consolas, monospace; }
+  table td, table th { white-space: nowrap; }
+  canvas { max-height: 360px; }
+</style>
+</head>
+<body>
+<main class="container">
+  <h1>NISA ⇄ 特定口座 取り崩しシミュレーター</h1>
+  <p class="muted">取り崩し戦略の違いによる最終資産への影響を比較します。</p>
+
+  <div class="grid grid-2">
+    <!-- 左：入力 -->
+    <section>
+      <form id="form">
+        <h3>入力</h3>
+        <fieldset>
+          <legend>NISA口座</legend>
+          <label>資産（万円）
+            <input type="number" id="nisaValue" value="300" min="0" step="10">
+          </label>
+          <label>含み益（%）
+            <input type="number" id="nisaGainPct" value="50" step="1">
+          </label>
+          <label>年間想定リターン（%）
+            <input type="number" id="nisaReturn" value="5" step="0.1">
+          </label>
+        </fieldset>
+        <fieldset>
+          <legend>特定口座</legend>
+          <label>資産（万円）
+            <input type="number" id="taxableValue" value="300" min="0" step="10">
+          </label>
+          <label>含み益（%）
+            <input type="number" id="taxableGainPct" value="50" step="1">
+          </label>
+          <label>年間想定リターン（%）
+            <input type="number" id="taxReturn" value="5" step="0.1">
+          </label>
+        </fieldset>
+
+        <label>取り崩し額（万円/年）
+          <input type="number" id="withdraw" value="30" min="0" step="1">
+        </label>
+
+        <fieldset>
+          <legend>取り崩し優先順位</legend>
+          <label><input type="radio" name="priority" value="taxable_first" checked> 特定口座から優先</label>
+          <label><input type="radio" name="priority" value="nisa_first"> NISAから優先</label>
+        </fieldset>
+
+        <label>シミュレーション年数
+          <input type="number" id="years" value="40" min="1" step="1">
+        </label>
+
+        <button type="submit">計算する</button>
+      </form>
+    </section>
+
+    <!-- 右：結果 -->
+    <section>
+      <h3>残高推移（合計）</h3>
+      <canvas id="chart"></canvas>
+      <h3>年次内訳</h3>
+      <table id="resultTable">
+        <thead></thead>
+        <tbody></tbody>
+      </table>
+    </section>
+  </div>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script>
+function parseInput(){
+  const nisaVal = Number(document.getElementById('nisaValue').value)*10000;
+  const nisaGainPct = Number(document.getElementById('nisaGainPct').value);
+  const nisaReturn = Number(document.getElementById('nisaReturn').value)/100;
+
+  const taxVal = Number(document.getElementById('taxableValue').value)*10000;
+  const taxGainPct = Number(document.getElementById('taxableGainPct').value);
+  const taxReturn = Number(document.getElementById('taxReturn').value)/100;
+
+  const withdraw = Number(document.getElementById('withdraw').value)*10000;
+  const years = Number(document.getElementById('years').value);
+  const priority = [...document.querySelectorAll('input[name="priority"]')].find(r=>r.checked).value;
+
+  // 元本 = 時価 / (1 + 含み益%)
+  const nisaBasis = nisaVal / (1 + nisaGainPct/100);
+  const taxBasis  = taxVal / (1 + taxGainPct/100);
+
+  return {nisaVal,nisaBasis,nisaReturn,taxVal,taxBasis,taxReturn,withdraw,years,priority};
+}
+
+function simulate({nisaVal,nisaBasis,nisaReturn,taxVal,taxBasis,taxReturn,withdraw,years,priority}){
+  let nisaV=nisaVal, nisaB=nisaBasis;
+  let taxV=taxVal, taxB=taxBasis;
+  const rows=[];
+  for(let y=1;y<=years;y++){
+    // 成長
+    nisaV *= (1+nisaReturn);
+    taxV  *= (1+taxReturn);
+
+    // 取り崩し
+    let need=withdraw;
+    if(priority==="nisa_first"){
+      if(nisaV>0){
+        const take=Math.min(nisaV,need);
+        nisaV-=take; need-=take;
+      }
+    }
+    if(need>0){
+      if(taxV>0){
+        const gainRatio=(taxV-taxB)/taxV;
+        const takeRate=1-0.20315*gainRatio;
+        let gross=need/takeRate;
+        if(gross>taxV) gross=taxV;
+        const realizedGain=gross*gainRatio;
+        const tax=realizedGain*0.20315;
+        const net=gross-tax;
+        const basisReduction=taxB*(gross/taxV);
+        taxV-=gross;
+        taxB-=basisReduction;
+        need-=net;
+      }
+    }
+    if(need>0 && priority==="taxable_first" && nisaV>0){
+      const take=Math.min(nisaV,need);
+      nisaV-=take; need-=take;
+    }
+
+    rows.push({year:y,nisa:nisaV,tax:taxV,total:nisaV+taxV});
+    if(nisaV+taxV<=0) break;
+  }
+  return rows;
+}
+
+const form=document.getElementById('form');
+const tableHead=document.querySelector('#resultTable thead');
+const tableBody=document.querySelector('#resultTable tbody');
+let chart;
+
+form.addEventListener('submit',(e)=>{
+  e.preventDefault();
+  const params=parseInput();
+  const rowsN=simulate({...params,priority:"nisa_first"});
+  const rowsT=simulate({...params,priority:"taxable_first"});
+
+  // Chart
+  const labels=rowsN.map(r=>`${r.year}年`);
+  if(chart) chart.destroy();
+  chart=new Chart(document.getElementById('chart'),{
+    type:'line',
+    data:{
+      labels,
+      datasets:[
+        {label:"NISA優先",data:rowsN.map(r=>r.total),tension:.2},
+        {label:"特定優先",data:rowsT.map(r=>r.total),tension:.2}
+      ]
+    },
+    options:{responsive:true,plugins:{legend:{position:'bottom'}}}
+  });
+
+  // 表（選択戦略=入力で選んだ方）
+  const selRows=simulate(params);
+  tableHead.innerHTML=`<tr><th>年</th><th>NISA残高</th><th>特定残高</th><th>合計</th></tr>`;
+  tableBody.innerHTML=selRows.map(r=>`
+    <tr>
+      <td class="mono">${r.year}</td>
+      <td class="mono">${r.nisa.toLocaleString()}</td>
+      <td class="mono">${r.tax.toLocaleString()}</td>
+      <td class="mono"><b>${r.total.toLocaleString()}</b></td>
+    </tr>`).join('');
+});
+</script>
+</body>
+</html>

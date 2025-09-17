@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>NISA vs 特定口座 取り崩しシミュレーター</title>
+<link rel="preconnect" href="https://cdn.jsdelivr.net" />
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+<style>
+  :root { --pico-font-size: 16px; }
+  .grid { display: grid; gap: 1rem; }
+  @media (min-width: 1000px){ .grid-2 { grid-template-columns: 360px 1fr; } }
+  .muted { opacity: .75; font-size: 0.9rem; }
+  .mono { font-variant-numeric: tabular-nums; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+  table td, table th { white-space: nowrap; }
+  .badge { display:inline-block; padding:.2rem .5rem; border-radius:999px; background:var(--pico-muted-border-color); }
+  details[open] summary { margin-bottom:.5rem; }
+  canvas { max-height: 360px; }
+</style>
+</head>
+<body>
+<main class="container">
+  <h1>NISA ⇄ 特定口座 取り崩しシミュレーター</h1>
+  <p class="muted">非課税の複利を温存できるか（NISAを後回し）／課税口座を先に使うべきか などを年次で比較します。</p>
+
+  <div class="grid grid-2">
+    <!-- Left: Controls -->
+    <section>
+      <h3>入力</h3>
+      <form id="form">
+        <label>元本（円）
+          <input type="number" id="principal" value="60000000" min="0" step="10000" required>
+        </label>
+
+        <label>想定リターン（年率, %）
+          <input type="number" id="returnPct" value="5" step="0.1" required>
+        </label>
+
+        <label>取り崩し額（年, 円・手取り）
+          <input type="number" id="withdraw" value="3000000" min="0" step="10000" required>
+        </label>
+
+        <fieldset>
+          <legend>取り崩しの優先順位</legend>
+          <label>
+            <input type="radio" name="priority" value="taxable_first" checked>
+            特定口座から優先して取り崩し
+          </label>
+          <label>
+            <input type="radio" name="priority" value="nisa_first">
+            NISAから優先して取り崩し
+          </label>
+        </fieldset>
+
+        <details>
+          <summary>詳細設定</summary>
+          <div class="grid" style="grid-template-columns: 1fr 1fr;">
+            <label>NISA 初期配分（%）
+              <input type="number" id="nisaShare" value="50" min="0" max="100" step="1">
+            </label>
+            <label>シミュレーション年数
+              <input type="number" id="years" value="40" min="1" step="1">
+            </label>
+          </div>
+          <div class="grid" style="grid-template-columns: 1fr 1fr;">
+            <label>課税率（特定の売却益, %）
+              <input type="number" id="taxPct" value="20.315" step="0.001">
+            </label>
+            <label>初年度から取り崩す？
+              <select id="withdrawTiming">
+                <option value="after_growth" selected>運用後に取り崩し（標準）</option>
+                <option value="before_growth">運用前に取り崩し</option>
+              </select>
+            </label>
+          </div>
+          <p class="muted">注：配当課税・損益通算・損出し等は簡略化。特定口座は「売却時のみ課税」、NISAは恒久非課税として扱います。</p>
+        </details>
+
+        <button type="submit">計算する</button>
+      </form>
+
+      <article id="summary" style="margin-top:1rem;"></article>
+    </section>
+
+    <!-- Right: Charts + Table -->
+    <section>
+      <h3>残高推移（合計）</h3>
+      <canvas id="chart"></canvas>
+
+      <h3 style="margin-top:1rem;">選択戦略の年次内訳</h3>
+      <div class="muted" id="selectedLabel"></div>
+      <div style="overflow:auto;">
+        <table id="resultTable">
+          <thead></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script>
+/**
+ * 年次シミュレーション
+ * - 運用→取り崩し（選択可）
+ * - 特定口座は売却時のみ課税（プロラタで含み益を計算して課税）
+ * - NISAは非課税
+ */
+function simulate({principal, r, withdrawNet, years, taxRate, nisaShare, priority, withdrawTiming}) {
+  const nisa0 = principal * (nisaShare);
+  const taxable0 = principal - nisa0;
+  let nisa = nisa0;
+  let taxableV = taxable0;        // 時価
+  let taxableB = taxable0;        // コスト（原価）
+  const rows = [];
+  let depletedAt = null;
+
+  for (let y = 1; y <= years; y++) {
+    let startNisa = nisa;
+    let startTaxV = taxableV;
+    let startTaxB = taxableB;
+
+    // 1) 成長 or 取り崩し（順序の選択）
+    if (withdrawTiming === 'before_growth') {
+      const out = withdrawProcess(priority, withdrawNet, {nisa, taxableV, taxableB, taxRate});
+      ({nisa, taxableV, taxableB} = out.state);
+      var taxPaid = out.taxPaid;
+      var grossSold = out.grossSold;
+    }
+
+    // 成長
+    nisa *= (1 + r);
+    taxableV *= (1 + r);
+    // taxableB は投資の原価。配当再投資や課税繰延を無視する簡略モデルなので増やさない。
+
+    if (withdrawTiming === 'after_growth') {
+      const out = withdrawProcess(priority, withdrawNet, {nisa, taxableV, taxableB, taxRate});
+      ({nisa, taxableV, taxableB} = out.state);
+      var taxPaid = out.taxPaid;
+      var grossSold = out.grossSold;
+    }
+
+    const total = nisa + taxableV;
+
+    rows.push({
+      year: y,
+      startNisa, startTaxV, startTaxB,
+      nisa, taxableV, taxableB,
+      total, taxPaid, grossSold,
+    });
+
+    if (depletedAt === null && total <= 0.000001) {
+      depletedAt = y;
+      // 続行してもゼロ推移なので打ち切る
+      break;
+    }
+  }
+  const last = rows[rows.length - 1] || { total: nisa + taxableV };
+  return { rows, depletedAt, endTotal: last.total, endNisa: last.nisa, endTaxable: last.taxableV };
+}
+
+/** 取り崩し処理。手取り目標 withdrawNet を満たすため、課税口座は売却総額を逆算 */
+function withdrawProcess(priority, withdrawNet, {nisa, taxableV, taxableB, taxRate}) {
+  let remaining = withdrawNet;
+  let grossSold = 0;
+  let taxPaid = 0;
+
+  function sellFromNISA(amount) {
+    const sold = Math.min(amount, nisa);
+    nisa -= sold;
+    return sold; // NISAは非課税＝売却額＝手取り
+  }
+
+  function sellFromTaxable(netNeeded) {
+    if (taxableV <= 0 || netNeeded <= 0) return 0;
+    // 含み益比率
+    const gainRatio = taxableV > 0 ? Math.max(0, (taxableV - taxableB) / taxableV) : 0;
+    const takeRate = 1 - taxRate * gainRatio; // 手取り/売却総額
+    if (takeRate <= 0) {
+      // すべて含み益で税率100%超の極端値対策（現実には起こらない前提）
+      // 売り切って得られる手取りを返す
+      const netIfAll = taxableV * (1 - taxRate * gainRatio);
+      const realizedGainAll = Math.max(0, taxableV - taxableB);
+      const taxAll = realizedGainAll * taxRate;
+      taxableV = 0; taxableB = 0;
+      grossSold += 0; taxPaid += taxAll;
+      return netIfAll;
+    }
+    // 必要な売却総額を逆算
+    let gross = netNeeded / takeRate;
+    if (gross > taxableV) {
+      gross = taxableV; // 売り切り
+    }
+    // 実現益・税の計算（プロラタ）
+    const realizedGain = gross * gainRatio;
+    const tax = realizedGain * taxRate;
+    const net = gross - tax;
+
+    // 残高・原価を按分で減らす
+    const basisReduction = taxableV > 0 ? taxableB * (gross / taxableV) : 0;
+    taxableV -= gross;
+    taxableB -= basisReduction;
+
+    grossSold += gross;
+    taxPaid += tax;
+    return net;
+  }
+
+  const order = (priority === 'nisa_first') ? ['nisa', 'taxable'] : ['taxable', 'nisa'];
+
+  for (const src of order) {
+    if (remaining <= 0) break;
+    if (src === 'nisa') {
+      const got = sellFromNISA(remaining);
+      remaining -= got;
+    } else {
+      const got = sellFromTaxable(remaining);
+      remaining -= got;
+    }
+  }
+  // 残っていれば、もう売る資産がない＝取り崩し未達
+  return { 
+    state: { nisa, taxableV, taxableB },
+    taxPaid, grossSold
+  };
+}
+
+/** フォーマッタ */
+const JPY = new Intl.NumberFormat('ja-JP', { style: 'currency', currency: 'JPY', maximumFractionDigits: 0 });
+const PCT = x => (x*100).toFixed(2) + '%';
+
+/** UI */
+const form = document.getElementById('form');
+const tableHead = document.querySelector('#resultTable thead');
+const tableBody = document.querySelector('#resultTable tbody');
+const summary = document.getElementById('summary');
+const selectedLabel = document.getElementById('selectedLabel');
+let chart;
+
+function run() {
+  const principal = Number(document.getElementById('principal').value || 0);
+  const r = Number(document.getElementById('returnPct').value)/100;
+  const withdrawNet = Number(document.getElementById('withdraw').value || 0);
+  const years = Number(document.getElementById('years').value || 40);
+  const nisaSharePct = Math.min(100, Math.max(0, Number(document.getElementById('nisaShare').value || 50)));
+  const nisaShare = nisaSharePct / 100;
+  const taxRate = Number(document.getElementById('taxPct').value)/100;
+  const withdrawTiming = document.getElementById('withdrawTiming').value;
+  const priority = [...document.querySelectorAll('input[name="priority"]')].find(r=>r.checked).value;
+
+  // 2戦略を同時に計算（グラフ比較用）
+  const sTaxableFirst = simulate({principal, r, withdrawNet, years, taxRate, nisaShare, priority:'taxable_first', withdrawTiming});
+  const sNisaFirst     = simulate({principal, r, withdrawNet, years, taxRate, nisaShare, priority:'nisa_first',     withdrawTiming});
+  const selected = (priority === 'taxable_first') ? sTaxableFirst : sNisaFirst;
+
+  // サマリー
+  const badgeSel = (priority === 'taxable_first') ? '特定口座→NISA' : 'NISA→特定口座';
+  const badgeOther = (priority === 'taxable_first') ? 'NISA→特定口座' : '特定口座→NISA';
+  summary.innerHTML = `
+    <div class="grid" style="grid-template-columns: 1fr 1fr;">
+      <div>
+        <strong>選択戦略：<span class="badge">${badgeSel}</span></strong><br>
+        終了時総資産：<span class="mono">${JPY.format(selected.endTotal)}</span><br>
+        （内訳 NISA：${JPY.format(selected.endNisa)} / 特定：${JPY.format(selected.endTaxable)}）<br>
+        枯渇年：<span class="mono">${selected.depletedAt ? selected.depletedAt + ' 年目' : '未枯渇'}</span>
+      </div>
+      <div>
+        <strong>参考（もう一方）：<span class="badge">${badgeOther}</span></strong><br>
+        終了時総資産：<span class="mono">${JPY.format((priority==='taxable_first'? sNisaFirst.endTotal : sTaxableFirst.endTotal))}</span><br>
+        枯渇年：<span class="mono">${(priority==='taxable_first'? sNisaFirst.depletedAt : sTaxableFirst.depletedAt) || '未枯渇'}</span>
+      </div>
+    </div>
+  `;
+
+  // グラフ
+  const labels = Array.from({length: Math.max(sTaxableFirst.rows.length, sNisaFirst.rows.length)}, (_,i)=> `${i+1}年目`);
+  const dataTaxableFirst = sTaxableFirst.rows.map(r=> r.total);
+  const dataNisaFirst    = sNisaFirst.rows.map(r=> r.total);
+
+  if (chart) chart.destroy();
+  chart = new Chart(document.getElementById('chart'), {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [
+        { label: '特定口座→NISA（合計残高）', data: dataTaxableFirst, tension: .15 },
+        { label: 'NISA→特定口座（合計残高）', data: dataNisaFirst, tension: .15 },
+      ]
+    },
+    options: {
+      responsive: true,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { position: 'bottom' },
+        tooltip: {
+          callbacks: {
+            label: ctx => `${ctx.dataset.label}: ${JPY.format(ctx.parsed.y)}`
+          }
+        }
+      },
+      scales: {
+        y: { ticks: { callback: v => JPY.format(v) } }
+      }
+    }
+  });
+
+  // テーブル（選択戦略の詳細）
+  selectedLabel.textContent = `表示中：${badgeSel}（年次内訳）`;
+  tableHead.innerHTML = `
+    <tr>
+      <th>年</th>
+      <th>期首NISA</th>
+      <th>期首特定(時価)</th>
+      <th>期首特定(原価)</th>
+      <th>当年 税額</th>
+      <th>当年 総売却額</th>
+      <th>期末NISA</th>
+      <th>期末特定(時価)</th>
+      <th>期末特定(原価)</th>
+      <th>合計</th>
+    </tr>
+  `;
+  tableBody.innerHTML = selected.rows.map(r => `
+    <tr>
+      <td class="mono">${r.year}</td>
+      <td class="mono">${JPY.format(r.startNisa)}</td>
+      <td class="mono">${JPY.format(r.startTaxV)}</td>
+      <td class="mono">${JPY.format(r.startTaxB)}</td>
+      <td class="mono">${JPY.format(r.taxPaid || 0)}</td>
+      <td class="mono">${JPY.format(r.grossSold || 0)}</td>
+      <td class="mono">${JPY.format(r.nisa)}</td>
+      <td class="mono">${JPY.format(r.taxableV)}</td>
+      <td class="mono">${JPY.format(r.taxableB)}</td>
+      <td class="mono"><strong>${JPY.format(r.total)}</strong></td>
+    </tr>
+  `).join('');
+}
+
+form.addEventListener('submit', (e) => { e.preventDefault(); run(); });
+window.addEventListener('DOMContentLoaded', run);
+</script>
+</body>
+</html>

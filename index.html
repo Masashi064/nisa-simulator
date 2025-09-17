@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>NISA vs 特定口座 取り崩しシミュレーター</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css"/>
+<style>
+  :root { --pico-font-size: 16px; }
+  .grid { display: grid; gap: 1rem; }
+  @media(min-width: 1000px){ .grid-2 { grid-template-columns: 360px 1fr; } }
+  .mono { font-variant-numeric: tabular-nums; font-family: ui-monospace, Consolas, monospace; }
+  canvas { max-height: 360px; }
+</style>
+</head>
+<body>
+<main class="container">
+  <h1>NISA ⇄ 特定口座 取り崩しシミュレーター</h1>
+
+  <div class="grid grid-2">
+    <!-- 入力 -->
+    <section>
+      <form id="form">
+        <fieldset>
+          <legend>NISA口座</legend>
+          <label>資産（万円）<input type="number" id="nisaValue" value="300" step="10"></label>
+          <label>年間想定リターン（%）<input type="number" id="nisaReturn" value="5" step="0.1"></label>
+        </fieldset>
+
+        <fieldset>
+          <legend>特定口座</legend>
+          <label>資産（万円）<input type="number" id="taxValue" value="300" step="10"></label>
+          <label>評価損益率（%）※取り崩し開始時点 <input type="number" id="taxGainPct" value="50" step="1"></label>
+          <label>年間想定リターン（%）<input type="number" id="taxReturn" value="5" step="0.1"></label>
+        </fieldset>
+
+        <label>取り崩し額（万円/年）※税金を差し引いた額を入力
+          <input type="number" id="withdraw" value="30" step="1">
+        </label>
+
+        <fieldset>
+          <legend>取り崩し優先順位</legend>
+          <label><input type="radio" name="priority" value="taxable_first" checked> 特定口座から優先して取り崩し</label>
+          <label><input type="radio" name="priority" value="nisa_first"> NISAから優先して取り崩し</label>
+        </fieldset>
+
+        <label>シミュレーション年数
+          <input type="number" id="years" value="100" min="1" step="1">
+        </label>
+
+        <button type="submit">計算する</button>
+      </form>
+    </section>
+
+    <!-- 出力 -->
+    <section>
+      <h3>残高推移（合計）</h3>
+      <canvas id="chart"></canvas>
+      <h3>年次内訳</h3>
+      <table id="resultTable">
+        <thead></thead>
+        <tbody></tbody>
+      </table>
+    </section>
+  </div>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script>
+const TAX_RATE = 0.20315;
+
+function toBasis(value, gainPct){
+  return value*10000 / (1+gainPct/100);
+}
+
+function simulate({nisaV,nisaR,taxV,taxB,taxR,withdraw,years,priority}){
+  const rows=[];
+  for(let y=1;y<=years;y++){
+    nisaV *= (1+nisaR);
+    taxV  *= (1+taxR);
+
+    let need=withdraw, taxPaid=0, handTaken=0;
+
+    if(priority==="nisa_first"){
+      const take=Math.min(nisaV,need);
+      nisaV-=take; need-=take; handTaken+=take;
+    }
+    if(need>0 && taxV>0){
+      const gainRatio=(taxV-taxB)/taxV;
+      const takeRate=1-TAX_RATE*gainRatio;
+      let gross=need/takeRate;
+      if(gross>taxV) gross=taxV;
+      const realizedGain=gross*gainRatio;
+      const tax=realizedGain*TAX_RATE;
+      const net=gross-tax;
+      if(taxV>0){
+        const basisReduction = taxB * (gross/taxV);
+        taxV-=gross; taxB-=basisReduction;
+      }
+      need-=net; taxPaid+=tax; handTaken+=net;
+    }
+    if(priority==="taxable_first" && need>0){
+      const take=Math.min(nisaV,need);
+      nisaV-=take; need-=take; handTaken+=take;
+    }
+
+    rows.push({year:y,nisa:nisaV,tax:taxV,total:nisaV+taxV,hand:handTaken,taxPaid:taxPaid});
+  }
+  return rows;
+}
+
+const form=document.getElementById('form');
+const tableHead=document.querySelector('#resultTable thead');
+const tableBody=document.querySelector('#resultTable tbody');
+let chart;
+
+form.addEventListener('submit',(e)=>{
+  e.preventDefault();
+  const nisaVal=Number(document.getElementById('nisaValue').value);
+  const nisaR=Number(document.getElementById('nisaReturn').value)/100;
+  const taxVal=Number(document.getElementById('taxValue').value);
+  const taxGain=Number(document.getElementById('taxGainPct').value);
+  const taxR=Number(document.getElementById('taxReturn').value)/100;
+  const withdraw=Number(document.getElementById('withdraw').value)*10000;
+  const years=Number(document.getElementById('years').value);
+  const priority=[...document.querySelectorAll('input[name="priority"]')].find(r=>r.checked).value;
+
+  let nisaAsset=nisaVal*10000;
+  let taxAsset=taxVal*10000;
+  let taxBasis=toBasis(taxVal,taxGain);
+
+  // 両方計算
+  const rowsN=simulate({nisaV:nisaAsset,nisaR,taxV:taxAsset,taxB:taxBasis,taxR,withdraw,years,priority:"nisa_first"});
+  const rowsT=simulate({nisaV:nisaAsset,nisaR,taxV:taxAsset,taxB:taxBasis,taxR,withdraw,years,priority:"taxable_first"});
+  const rows = (priority==="nisa_first") ? rowsN : rowsT;  // 🔹ここを追加
+
+  // グラフ
+  const labels=rows.map(r=>`${r.year}年`);
+  if(chart) chart.destroy();
+
+  let selectedDataset, otherDataset;
+  if(priority==="nisa_first"){
+    selectedDataset = {label:"NISA優先", data:rowsN.map(r=>r.total), borderColor:"blue", backgroundColor:"blue", tension:.2};
+    otherDataset    = {label:"特定優先", data:rowsT.map(r=>r.total), borderColor:"red", backgroundColor:"red", tension:.2};
+  } else {
+    selectedDataset = {label:"特定優先", data:rowsT.map(r=>r.total), borderColor:"blue", backgroundColor:"blue", tension:.2};
+    otherDataset    = {label:"NISA優先", data:rowsN.map(r=>r.total), borderColor:"red", backgroundColor:"red", tension:.2};
+  }
+
+  chart=new Chart(document.getElementById('chart'),{
+    type:'line',
+    data:{ labels, datasets:[selectedDataset, otherDataset] },
+    options:{plugins:{legend:{position:'bottom'}}}
+  });
+
+  // 表
+  tableHead.innerHTML=`<tr>
+    <th>年</th><th>NISA残高</th><th>特定残高</th><th>合計</th><th>取り崩し額［手取り］</th><th>税金</th>
+  </tr>`;
+  tableBody.innerHTML=rows.map(r=>`
+    <tr>
+      <td class="mono">${r.year}</td>
+      <td class="mono">${Math.round(r.nisa).toLocaleString()}</td>
+      <td class="mono">${Math.round(r.tax).toLocaleString()}</td>
+      <td class="mono"><b>${Math.round(r.total).toLocaleString()}</b></td>
+      <td class="mono">${Math.round(r.hand).toLocaleString()}</td>
+      <td class="mono">${Math.round(r.taxPaid).toLocaleString()}</td>
+    </tr>`).join('');
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>NISA vs 特定口座 シミュレーション</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; }
+    h1 { color: #333; }
+    label { display: block; margin-top: 10px; }
+    input { margin-left: 5px; }
+    table { border-collapse: collapse; margin-top: 20px; width: 100%; }
+    th, td { border: 1px solid #aaa; padding: 6px; text-align: right; }
+    th { background: #f2f2f2; }
+    .chart-container { width: 90%; max-width: 800px; margin-top: 30px; }
+  </style>
+</head>
+<body>
+  <h1>NISA vs 特定口座 取り崩しシミュレーション</h1>
+
+  <form id="simForm">
+    <h3>初期資産入力</h3>
+    <label>NISA資産 (万円): <input type="number" id="nisaAsset" value="600"></label>
+    <label>NISA含み益 (%) : <input type="number" id="nisaGain" value="50"></label>
+    <label>NISA年間リターン (%) : <input type="number" id="nisaReturn" value="3"></label>
+
+    <label>特定資産 (万円): <input type="number" id="taxableAsset" value="600"></label>
+    <label>特定含み益 (%) : <input type="number" id="taxableGain" value="50"></label>
+    <label>特定年間リターン (%) : <input type="number" id="taxableReturn" value="3"></label>
+
+    <label>年間取り崩し額 (万円): <input type="number" id="withdraw" value="100"></label>
+    <label>シミュレーション年数: <input type="number" id="years" value="20"></label>
+
+    <button type="button" onclick="runSimulation()">シミュレーション開始</button>
+  </form>
+
+  <div class="chart-container">
+    <canvas id="resultChart"></canvas>
+  </div>
+
+  <div id="resultTable"></div>
+
+<script>
+function runSimulation() {
+  // 入力取得
+  const nisaAsset = parseFloat(document.getElementById('nisaAsset').value);
+  const nisaGain = parseFloat(document.getElementById('nisaGain').value);
+  const nisaReturn = parseFloat(document.getElementById('nisaReturn').value) / 100;
+  
+  const taxableAsset = parseFloat(document.getElementById('taxableAsset').value);
+  const taxableGain = parseFloat(document.getElementById('taxableGain').value);
+  const taxableReturn = parseFloat(document.getElementById('taxableReturn').value) / 100;
+  
+  const withdraw = parseFloat(document.getElementById('withdraw').value);
+  const years = parseInt(document.getElementById('years').value);
+
+  // 含み益から元本と利益を計算
+  function splitPrincipal(asset, gainPct) {
+    const principal = asset / (1 + gainPct / 100);
+    const profit = asset - principal;
+    return { principal, profit };
+  }
+  
+  const nisaSplit = splitPrincipal(nisaAsset, nisaGain);
+  const taxableSplit = splitPrincipal(taxableAsset, taxableGain);
+
+  // シミュレーションロジック
+  function simulate(nisaFirst) {
+    let nisa = { principal: nisaSplit.principal, profit: nisaSplit.profit };
+    let taxable = { principal: taxableSplit.principal, profit: taxableSplit.profit };
+    const results = [];
+
+    for (let year = 1; year <= years; year++) {
+      let needed = withdraw;
+
+      // NISA優先 or 特定優先で取り崩し順序決定
+      const order = nisaFirst ? ['nisa', 'taxable'] : ['taxable', 'nisa'];
+
+      for (const acct of order) {
+        let target = acct === 'nisa' ? nisa : taxable;
+        if (needed > 0) {
+          let available = target.principal + target.profit;
+          let used = Math.min(needed, available);
+          // 利益から先に取り崩す（課税の影響）
+          let fromProfit = Math.min(used, target.profit);
+          target.profit -= fromProfit;
+          used -= fromProfit;
+          target.principal -= used;
+          needed -= (fromProfit + used);
+        }
+      }
+
+      // 年末にリターンを反映
+      nisa.principal *= (1 + nisaReturn);
+      nisa.profit *= (1 + nisaReturn);
+      taxable.principal *= (1 + taxableReturn);
+      taxable.profit *= (1 + taxableReturn);
+
+      results.push({
+        year,
+        nisaTotal: nisa.principal + nisa.profit,
+        taxableTotal: taxable.principal + taxable.profit,
+        total: nisa.principal + nisa.profit + taxable.principal + taxable.profit
+      });
+    }
+    return results;
+  }
+
+  const resultNisaFirst = simulate(true);
+  const resultTaxFirst = simulate(false);
+
+  // グラフ描画
+  const ctx = document.getElementById('resultChart').getContext('2d');
+  if (window.myChart) window.myChart.destroy();
+  window.myChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: resultNisaFirst.map(r => r.year),
+      datasets: [
+        { label: 'NISA優先', data: resultNisaFirst.map(r => r.total), borderColor: 'blue', fill: false },
+        { label: '特定優先', data: resultTaxFirst.map(r => r.total), borderColor: 'red', fill: false }
+      ]
+    },
+    options: {
+      responsive: true,
+      scales: { y: { beginAtZero: true } }
+    }
+  });
+
+  // 表描画
+  let html = "<table><tr><th>年</th><th>NISA優先</th><th>特定優先</th></tr>";
+  for (let i = 0; i < years; i++) {
+    html += `<tr><td>${i+1}</td><td>${resultNisaFirst[i].total.toFixed(1)}</td><td>${resultTaxFirst[i].total.toFixed(1)}</td></tr>`;
+  }
+  html += "</table>";
+  document.getElementById('resultTable').innerHTML = html;
+}
+</script>
+</body>
+</html>
